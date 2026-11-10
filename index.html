@@ -453,17 +453,35 @@ function validateSessions(csv, currentWind){
     });
 }
 
-function mergeCapacities(sessions, raw){
-  const rows=parseCSV(raw), headers=(rows.shift()||[]).map(h=>h.toLowerCase());
-  const idCol=headers.indexOf('id'), capCol=headers.indexOf('capacity');
-  if(idCol<0||capCol<0) throw Error('Capacity fields unavailable');
+async function fetchLiveSheet(){
+  const urls=[CAPACITY_CSV,'https://docs.google.com/spreadsheets/d/1Hb0asq4lVBv75QAIA5muQsXcKnqnIW8lstS10_f56nY/gviz/tq?tqx=out:csv&gid=855619493'];
+  for(const url of urls){try{
+    const raw=await (await request(url+'&t='+Date.now())).text();
+    const head=(parseCSV(raw)[0]||[]).map(x=>x.trim().toLowerCase());
+    if(head.includes('id')&&head.includes('capacity'))return raw;
+  }catch(e){console.warn('Sheet retrieval:',e)}}
+  return null;
+}
+function mergeCapacities(sessions,raw,currentWind){
+  const rows=parseCSV(raw), headers=(rows.shift()||[]).map(h=>h.trim().toLowerCase());
+  if(!headers.includes('id')||!headers.includes('capacity'))throw Error('Capacity fields unavailable');
   const map=new Map();
-  for(const row of rows){const id=(row[idCol]||'').toUpperCase();const n=toNonNegativeNumber(row[capCol]);if(/^DS\d{2}$/.test(id)&&Number.isInteger(n))map.set(id,map.has(id)?null:n);}
-  return sessions.map(x=>({...x,capacity:map.has(x.id.toUpperCase())?map.get(x.id.toUpperCase()):null}));
+  for(const row of rows){
+    const item=Object.fromEntries(headers.map((h,i)=>[h,row[i]||'']));
+    const id=item.id.toUpperCase();
+    if(/^DS\d{2}$/.test(id))map.set(id,map.has(id)?null:item);
+  }
+  return sessions.map(x=>{
+    const item=map.get(x.id.toUpperCase());
+    if(!item)return {...x,capacity:null};
+    const cap=toNonNegativeNumber(item.capacity),limit=toNonNegativeNumber(item.max_wind_kmh),duration=toNonNegativeNumber(item.duration_min);
+    return {...x,session:item.session||x.session,activity:item.activity||x.activity,start_time:item.start_time||x.start_time,duration_min:duration??x.duration_min,capacity:Number.isInteger(cap)?cap:null,max_wind_kmh:limit??x.max_wind_kmh,wind_status:(limit??x.max_wind_kmh)==null?'Unknown':currentWind<=(limit??x.max_wind_kmh)?'Within limit':'Above limit'};
+  });
 }
 function capacityReply(q,sessions){
   if(!/\b(capacity|capacities|maximum number|total places|total slots|maximum participants|how many (?:people|participants).*(?:hold|accommodate|fit))\b/i.test(q))return null;
   const ids=[...new Set((q.match(/\bDS\d{2}\b/gi)||[]).map(x=>x.toUpperCase()))];
+  const range=q.match(/\bDS(\d{2})\s*(?:to|through|[-–])\s*DS(\d{2})\b/i); if(range){const lo=Number(range[1]),hi=Number(range[2]);if(lo<=hi&&hi-lo<100){ids.splice(0,ids.length,...Array.from({length:hi-lo+1},(_,i)=>'DS'+String(lo+i).padStart(2,'0')));}}
   const named=sessions.filter(x=>q.toLowerCase().includes(x.session.toLowerCase()));
   const targets=ids.length?ids.map(id=>sessions.find(x=>x.id.toUpperCase()===id)||{id}):named.length?named:sessions;
   return targets.map(x=>!x.session?x.id+': Not listed today.':x.id+' — '+x.session+': '+(x.capacity==null?'Total capacity could not be confirmed.':'Total capacity '+x.capacity+' people.')+(x.slots_left==null?'':' '+x.slots_left+' '+(x.slots_left===1?'place':'places')+' currently available.')).join('\n');
@@ -492,7 +510,7 @@ async function ask(question){
     const [csvRes, weatherRes, capacityRaw] = await Promise.all([
       request(CSV+'?t='+Date.now()),
       request(WEATHER),
-      request(CAPACITY_CSV+'&t='+Date.now()).then(r=>r.text()).catch(()=>null)
+      fetchLiveSheet()
     ]);
 
     const [csv, weather] = await Promise.all([csvRes.text(), weatherRes.json()]);
@@ -500,7 +518,7 @@ async function ask(question){
     if(!current || !Number.isFinite(current.wind_speed_10m)) throw new Error('Weather data is unavailable right now.');
 
     let sessions=validateSessions(csv, current.wind_speed_10m);
-    if(capacityRaw){try{sessions=mergeCapacities(sessions,capacityRaw)}catch(e){console.warn('Capacity source:',e)}}
+    if(capacityRaw){try{sessions=mergeCapacities(sessions,capacityRaw,current.wind_speed_10m)}catch(e){console.warn('Capacity source:',e)}}
     if(!sessions.length) throw new Error('No sessions were returned.');
 
     const fetchedLabel=new Date().toLocaleTimeString('en-IE',{timeZone:'Europe/Dublin',hour12:false});
